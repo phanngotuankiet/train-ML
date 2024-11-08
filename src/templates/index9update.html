@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Video Upload and Processing</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .progress {
+        margin: 20px 0;
+        padding: 10px;
+        background: #f0f0f0;
+      }
+      video {
+        max-width: 100%;
+      }
+      .results-container {
+        margin-top: 20px;
+        padding: 15px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+      }
+      .behavior-stats {
+        display: flex;
+        justify-content: space-around;
+        margin: 20px 0;
+      }
+      .stat-box {
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 5px;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+      .stat-box h4 {
+        margin: 0 0 10px 0;
+        color: #333;
+      }
+      .stat-box p {
+        font-size: 24px;
+        font-weight: bold;
+        margin: 0;
+        color: #2c3e50;
+      }
+      .timeline {
+        margin: 20px 0;
+        padding: 10px;
+        background: #f9f9f9;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+      .object-list {
+        margin: 10px 0;
+        padding: 10px;
+        background: #fff;
+        border: 1px solid #eee;
+      }
+      .high-confidence {
+        color: #2ecc71;
+      }
+      .medium-confidence {
+        color: #f1c40f;
+      }
+      .low-confidence {
+        color: #e74c3c;
+      }
+      .stats-overview {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 15px;
+        margin: 20px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Violence Detection System</h1>
+    <form id="uploadForm">
+      <input type="file" name="video" accept=".mp4,.avi,.mov" required />
+      <button type="submit">Upload & Process</button>
+    </form>
+
+    <div id="status" class="progress"></div>
+    <div id="result"></div>
+    <div id="crimeResults" class="results-container">
+      <h2>Analysis Results</h2>
+
+      <!-- Thống kê tổng quan -->
+      <div class="behavior-stats" id="behaviorStats">
+        <!-- Sẽ được điền bởi JavaScript -->
+      </div>
+
+      <!-- Timeline của các sự kiện -->
+      <h3>Event Timeline</h3>
+      <div class="timeline" id="eventTimeline">
+        <!-- Sẽ được điền bởi JavaScript -->
+      </div>
+
+      <!-- Chi tiết object detection -->
+      <h3>Object Detection Details</h3>
+      <div id="objectDetails">
+        <!-- Sẽ được điền bởi JavaScript -->
+      </div>
+    </div>
+
+    <script>
+      document.getElementById("uploadForm").onsubmit = async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        const statusDiv = document.getElementById("status");
+
+        try {
+          statusDiv.textContent = "Uploading...";
+          const response = await fetch("/upload", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await response.json();
+
+          if (data.task_id) {
+            checkStatus(data.task_id);
+          }
+        } catch (error) {
+          statusDiv.textContent = `Error: ${error.message}`;
+        }
+      };
+
+      function checkStatus(taskId) {
+        const statusDiv = document.getElementById("status");
+        const resultDiv = document.getElementById("result");
+        const crimeDiv = document.getElementById("crimeResults");
+
+        const interval = setInterval(async () => {
+          try {
+            const response = await fetch(`/status/${taskId}`);
+            const data = await response.json();
+
+            statusDiv.textContent = `Processing: ${data.progress}%`;
+
+            if (data.status === "completed") {
+              clearInterval(interval);
+              const videoName = taskId.split("_")[1];
+
+              resultDiv.innerHTML = `
+                            <h3>Processing completed!</h3>
+                            <video controls>
+                                <source src="/results/processed_${videoName}" type="video/mp4">
+                            </video>
+                        `;
+
+              if (data.results && data.results.length > 0) {
+                updateResults(data.results);
+              }
+            }
+
+            if (data.status === "error") {
+              clearInterval(interval);
+              statusDiv.textContent = `Error: ${data.error}`;
+            }
+          } catch (error) {
+            clearInterval(interval);
+            statusDiv.textContent = `Error: ${error.message}`;
+          }
+        }, 1000);
+      }
+
+      function updateResults(results) {
+        const stats = calculateStats(results);
+
+        // Cập nhật stats overview cho tất cả 13 loại
+        document.getElementById("behaviorStats").innerHTML = `
+                <div class="stats-overview">
+                    <div class="stat-box">
+                        <h4>Assault Events</h4>
+                        <p>${stats.assault || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Robbery Events</h4>
+                        <p>${stats.robbery || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Normal Videos</h4>
+                        <p>${stats.normalvideos || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Road Accidents</h4>
+                        <p>${stats.roadaccidents || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Shooting Events</h4>
+                        <p>${stats.shooting || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Arrest Events</h4>
+                        <p>${stats.arrest || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Vandalism Events</h4>
+                        <p>${stats.vandalism || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Arson Events</h4>
+                        <p>${stats.arson || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Burglary Events</h4>
+                        <p>${stats.burglary || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Explosion Events</h4>
+                        <p>${stats.explosion || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Abuse Events</h4>
+                        <p>${stats.abuse || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Shoplifting Events</h4>
+                        <p>${stats.shoplifting || 0}</p>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Stealing Events</h4>
+                        <p>${stats.stealing || 0}</p>
+                    </div>
+                </div>
+            `;
+
+        // Cập nhật timeline
+        const timeline = document.getElementById("eventTimeline");
+        timeline.innerHTML = results
+          .map(
+            (frame, index) => `
+                <div class="event-item ${frame.behavior.toLowerCase()}">
+                    <strong>Frame ${frame.frame}</strong>: ${frame.behavior}
+                    ${
+                      frame.objects.length
+                        ? `(${frame.objects.length} objects detected)`
+                        : ""
+                    }
+                </div>
+            `
+          )
+          .join("");
+
+        // Cập nhật object details
+        const objectDetails = document.getElementById("objectDetails");
+        objectDetails.innerHTML = results
+          .map((frame) => {
+            if (frame.objects.length === 0) return "";
+
+            return `
+                    <div class="object-list">
+                        <h4>Frame ${frame.frame}</h4>
+                        ${frame.objects
+                          .map(
+                            (obj) => `
+                            <div class="object-item ${getConfidenceClass(
+                              obj.confidence
+                            )}">
+                                ${obj.class}: ${(obj.confidence * 100).toFixed(
+                              2
+                            )}%
+                            </div>
+                        `
+                          )
+                          .join("")}
+                    </div>
+                `;
+          })
+          .join("");
+      }
+
+      function calculateStats(results) {
+        return results.reduce(
+          (acc, frame) => {
+            const behavior = frame.behavior.toLowerCase();
+            // Khởi tạo counter nếu chưa tồn tại
+            if (!acc[behavior]) {
+              acc[behavior] = 0;
+            }
+            acc[behavior]++;
+            return acc;
+          },
+          {
+            assault: 0,
+            robbery: 0,
+            normalvideos: 0,
+            roadaccidents: 0,
+            shooting: 0,
+            arrest: 0,
+            vandalism: 0,
+            arson: 0,
+            burglary: 0,
+            explosion: 0,
+            abuse: 0,
+            shoplifting: 0,
+            stealing: 0,
+          }
+        );
+      }
+
+      function getConfidenceClass(confidence) {
+        if (confidence > 0.7) return "high-confidence";
+        if (confidence > 0.5) return "medium-confidence";
+        return "low-confidence";
+      }
+    </script>
+  </body>
+</html>

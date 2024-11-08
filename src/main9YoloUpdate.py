@@ -13,32 +13,41 @@ from PIL import Image
 from torchvision.models import ResNet50_Weights
 import yaml
 import cv2
+from torchvision.transforms import (
+    RandomHorizontalFlip, RandomRotation, ColorJitter, 
+    RandomResizedCrop, RandomAffine, RandomPerspective,
+    GaussianBlur, RandomAdjustSharpness
+)
+from torch.utils.data import WeightedRandomSampler
 
 class CustomCNN(nn.Module):
     def __init__(self, num_classes=14):
         super(CustomCNN, self).__init__()
-        # CNN Layers
+        # Increase dropout rates and add L2 regularization
         self.conv_layers = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.2),  # Add dropout after each block
             
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.3),
             
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.4),
             
             nn.Conv2d(256, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.3),
+            nn.Dropout2d(0.5),
         )
         
         # Calculate feature dimensions
@@ -52,13 +61,13 @@ class CustomCNN(nn.Module):
             
         # Combine features
         self.combine_features = nn.Sequential(
-            nn.Linear(self.feature_dims + 1000, 1024),  # ResNet outputs 1000 features
+            nn.Linear(self.feature_dims + 1000, 512),  # Reduced from 1024
+            nn.ReLU(),
+            nn.Dropout(0.6),
+            nn.Linear(512, 256),  # Added intermediate layer
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_classes)
+            nn.Linear(256, num_classes)
         )
 
     def _get_conv_output_dims(self):
@@ -369,46 +378,32 @@ class EnhancedDataset(Dataset):
             if img_name.lower().endswith(('.png', '.jpg', '.jpeg'))
         ]
 
-    def __getitem__(self, index):
-        img_path = self.image_paths[index]
-        
-        # Get corresponding label file
-        label_path = os.path.join(
-            self.label_dir, 
-            os.path.splitext(os.path.basename(img_path))[0] + '.txt'
-        )
-        
+    def __getitem__(self, idx):
         try:
-            # Load image for both YOLO and CNN
+            # Load image
             image = Image.open(img_path).convert('RGB')
             
-            # Create two copies of the image
-            yolo_image = image.copy()
-            cnn_image = image.copy()
-            
-            # Apply respective transforms
-            if self.yolo_transform:
-                yolo_image = self.yolo_transform(yolo_image)
-            if self.cnn_transform:
-                cnn_image = self.cnn_transform(cnn_image)
-            
-            # Load and process label
-            with open(label_path, 'r') as f:
-                # YOLO format: class x_center y_center width height
-                # We only need the class (first number)
-                line = f.readline().strip().split()[0]
-                label = int(float(line))  # Convert to int, handling float strings
+            # Apply transforms with error handling
+            try:
+                yolo_image = self.yolo_transform(image) if self.yolo_transform else transforms.ToTensor()(image)
+                cnn_image = self.cnn_transform(image) if self.cnn_transform else transforms.ToTensor()(image)
+            except Exception as e:
+                print(f"Transform error for {img_path}: {str(e)}")
+                # Fallback to basic transform
+                basic_transform = transforms.Compose([
+                    transforms.Resize((64, 64)),
+                    transforms.ToTensor()
+                ])
+                yolo_image = basic_transform(image)
+                cnn_image = basic_transform(image)
             
             return (yolo_image, cnn_image), label
-
+            
         except Exception as e:
             print(f"Error loading data for {img_path}: {str(e)}")
             # Return dummy data in case of error
-            dummy_yolo = torch.zeros((3, 64, 64)) if not self.yolo_transform else \
-                        self.yolo_transform(Image.new('RGB', (64, 64), color='black'))
-            dummy_cnn = torch.zeros((3, 64, 64)) if not self.cnn_transform else \
-                       self.cnn_transform(Image.new('RGB', (64, 64), color='black'))
-            return (dummy_yolo, dummy_cnn), 0
+            dummy = torch.zeros((3, 64, 64))
+            return (dummy, dummy), 0
 
     def __len__(self):
         return len(self.image_paths)
@@ -457,11 +452,39 @@ class YOLOCNNModel:
         self.early_stopping_counter = 0
         self.early_stopping_patience = 10
 
-    def calculate_class_weights(self, labels):
-        """Calculate class weights to handle imbalanced data"""
-        class_counts = torch.bincount(labels)
-        total = len(labels)
-        weights = total / (len(class_counts) * class_counts.float())
+        # Add class weights calculation
+        self.class_weights = self._compute_class_weights(data_yaml)
+        self.criterion = nn.CrossEntropyLoss(weight=self.class_weights, reduction='none')
+        
+        # Add weight decay to optimizer
+        self.optimizer = optim.AdamW(
+            self.cnn.parameters(), 
+            lr=0.001,
+            weight_decay=0.01  # L2 regularization
+        )
+        
+        # Modify learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,  # Less aggressive reduction
+            patience=2,   # Reduced patience
+            min_lr=1e-6  # Minimum learning rate
+        )
+
+    def _compute_class_weights(self, data_yaml):
+        """Compute class weights from training data"""
+        class_counts = torch.zeros(14)
+        train_dir = "data/processed/dataYOLO2/labels/train"
+        
+        for label_file in os.listdir(train_dir):
+            with open(os.path.join(train_dir, label_file), 'r') as f:
+                class_idx = int(float(f.readline().strip().split()[0]))
+                class_counts[class_idx] += 1
+        
+        # Compute inverse frequency weights
+        weights = 1.0 / (class_counts + 1)  # Add 1 to avoid division by zero
+        weights = weights / weights.sum() * len(weights)  # Normalize
         return weights.to(self.device)
 
     def train_epoch(self, epoch, total_epochs, train_loader):
@@ -549,42 +572,32 @@ class YOLOCNNModel:
         
         return accuracy
 
-    def train(self, train_loader, val_loader, epochs=100, save_path='model_yolo_cnn.pt'):
-        print(f"Training on device: {self.device}")
-        total_start_time = time.time()
+    def train(self, train_loader, val_loader, epochs):
+        best_val_loss = float('inf')
+        patience_counter = 0
         
-        # Resume training if checkpoint exists
-        start_epoch = self.resume_training(save_path)
-        
-        for epoch in range(start_epoch + 1, epochs + 1):
-            print(f"\n{'='*50}")
+        for epoch in range(self.current_epoch, self.current_epoch + epochs):
+            train_loss = self._train_epoch(train_loader)
+            val_accuracy, val_loss = self.validate(val_loader)
             
-            # Train epoch
-            train_accuracy = self.train_epoch(epoch, epochs, train_loader)
+            print(f'\nEpoch [{epoch+1}/{self.current_epoch + epochs}]')
+            print(f'Average Train Loss: {train_loss:.4f}')
+            print(f'Validation Loss: {val_loss:.4f}')
+            print(f'Validation Accuracy: {val_accuracy:.4f}')
             
-            # Validate
-            val_accuracy = self.validate(val_loader)
-            
-            # Learning rate scheduling
-            self.scheduler.step(val_accuracy)
-            
-            # Save best model
-            if val_accuracy > self.best_accuracy:
-                self.best_accuracy = val_accuracy
-                self.save_model(save_path)
-                print(f"Saved new best model with accuracy: {val_accuracy:.4f}")
-                self.early_stopping_counter = 0
+            # Early stopping based on validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                self.save_model()
             else:
-                self.early_stopping_counter += 1
-            
-            # Early stopping
-            if self.early_stopping_counter >= self.early_stopping_patience:
-                print(f"Early stopping triggered after {epoch} epochs")
+                patience_counter += 1
+                
+            if patience_counter >= self.early_stopping_patience:
+                print("Early stopping triggered")
                 break
-        
-        total_time = time.time() - total_start_time
-        print(f"\nTotal training time: {datetime.timedelta(seconds=int(total_time))}")
-        print(f"Best validation accuracy: {self.best_accuracy:.4f}")
+                
+            self.scheduler.step(val_accuracy)
 
     def save_model(self, save_path='model_yolo_cnn.pt'):
         """Save model state"""
@@ -723,41 +736,93 @@ class YOLOCNNModel:
    
 
 
-def main():
-    # Initialize data transforms
-    yolo_transform = transforms.Compose([
-        transforms.Resize((64, 64)),
-        transforms.ToTensor(),  # Đã chuyển về range [0-1]
-    ])
-    
-    # Transform cho CNN - thêm normalize ImageNet
-    cnn_transform = transforms.Compose([
+def get_transforms(is_training=True):
+    """
+    Get transforms for both YOLO and CNN paths
+    Args:
+        is_training (bool): Whether to include augmentation transforms
+    """
+    # Base transforms (always applied)
+    base_transforms = [
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    ]
     
+    # Augmentation transforms (only during training)
+    aug_transforms = [
+        # Geometric transforms
+        RandomHorizontalFlip(p=0.5),
+        RandomRotation(degrees=10),
+        RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0)),
+        RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        RandomPerspective(distortion_scale=0.2, p=0.5),
+        
+        # Color/intensity transforms
+        ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2,
+            hue=0.1
+        ),
+        GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        RandomAdjustSharpness(sharpness_factor=2, p=0.5),
+    ]
     
-    # Load datasets với 2 transforms
+    # CNN-specific normalization
+    cnn_normalize = [
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ]
+    
+    if is_training:
+        yolo_transform = transforms.Compose(aug_transforms + base_transforms)
+        cnn_transform = transforms.Compose(aug_transforms + base_transforms + cnn_normalize)
+    else:
+        yolo_transform = transforms.Compose(base_transforms)
+        cnn_transform = transforms.Compose(base_transforms + cnn_normalize)
+    
+    return yolo_transform, cnn_transform
+
+def get_sampler(dataset):
+    """Create weighted sampler for balanced batches"""
+    labels = []
+    for _, label in dataset:
+        labels.append(label)
+    
+    class_counts = torch.bincount(torch.tensor(labels))
+    weights = 1.0 / class_counts[labels]
+    sampler = WeightedRandomSampler(weights, len(weights))
+    return sampler
+
+def main():
+    # Get transforms for training data
+    train_yolo_transform, train_cnn_transform = get_transforms(is_training=True)
+    
+    # Get transforms for validation/test data (no augmentation)
+    val_yolo_transform, val_cnn_transform = get_transforms(is_training=False)
+    
+    # Load datasets with appropriate transforms
     train_dataset = EnhancedDataset(
         image_dir="data/processed/dataYOLO2/images/train",
         label_dir="data/processed/dataYOLO2/labels/train",
-        yolo_transform=yolo_transform,
-        cnn_transform=cnn_transform
+        yolo_transform=train_yolo_transform,
+        cnn_transform=train_cnn_transform
     )
     
     val_dataset = EnhancedDataset(
         image_dir="data/processed/dataYOLO2/images/val",
         label_dir="data/processed/dataYOLO2/labels/val",
-        yolo_transform=yolo_transform,
-        cnn_transform=cnn_transform
+        yolo_transform=val_yolo_transform,
+        cnn_transform=val_cnn_transform
     )
     
     test_dataset = EnhancedDataset(
         image_dir="data/processed/dataYOLO2/images/test",
         label_dir="data/processed/dataYOLO2/labels/test",
-        yolo_transform=yolo_transform,
-        cnn_transform=cnn_transform
+        yolo_transform=val_yolo_transform,
+        cnn_transform=val_cnn_transform
     )
     
     print(f"Train dataset size: {len(train_dataset)}")
@@ -768,7 +833,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=32,
-        shuffle=True,
+        sampler=get_sampler(train_dataset),  # Add weighted sampler
         num_workers=0
     )
     
@@ -794,7 +859,7 @@ def main():
     start_epoch = model.resume_training()
     
     # Train model
-    remaining_epochs = 100 - start_epoch
+    remaining_epochs = 5 - start_epoch
     if remaining_epochs > 0:
         print(f"Starting training from epoch {start_epoch + 1}")
         model.train(train_loader, val_loader, epochs=remaining_epochs)

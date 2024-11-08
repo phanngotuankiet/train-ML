@@ -25,7 +25,7 @@ app = Flask(__name__)
 # Configuration
 UPLOAD_FOLDER = 'uploads'
 RESULTS_FOLDER = 'static/results'
-checkpoint_path = 'models/model_yolo_cnn.pt'
+checkpoint_path = 'model_yolo_cnn.pt'
 data_yaml = 'data/processed/dataYOLO2/data.yaml'
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
