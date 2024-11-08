@@ -1,0 +1,5 @@
+*.pt
+/data
+/myenv
+__pycache__/
+/_MACOSX/
