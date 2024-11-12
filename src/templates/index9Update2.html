@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Video Behavior Analysis</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .upload-form {
+        margin: 20px 0;
+        padding: 20px;
+        border: 1px solid #ccc;
+        border-radius: 5px;
+      }
+      .result {
+        margin-top: 20px;
+        display: none;
+      }
+      .loading {
+        display: none;
+        text-align: center;
+        margin: 20px 0;
+      }
+      video {
+        max-width: 100%;
+        margin: 20px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Video Behavior Analysis</h1>
+
+    <div class="upload-form">
+      <form id="uploadForm">
+        <input type="file" name="video" accept=".mp4,.avi,.mov" required />
+        <button type="submit">Analyze Video</button>
+      </form>
+    </div>
+
+    <div class="loading" id="loading">Analyzing video... Please wait...</div>
+
+    <div class="result" id="result">
+      <h2>Analysis Result</h2>
+      <div id="resultText"></div>
+      <h3>Result Video:</h3>
+      <video id="resultVideo" controls></video>
+    </div>
+
+    <script>
+      document.getElementById("uploadForm").onsubmit = async (e) => {
+        e.preventDefault();
+
+        const formData = new FormData(e.target);
+        const loading = document.getElementById("loading");
+        const result = document.getElementById("result");
+
+        loading.style.display = "block";
+        result.style.display = "none";
+
+        try {
+          const response = await fetch("/upload", {
+            method: "POST",
+            body: formData,
+          });
+
+          const data = await response.json();
+
+          if (data.success) {
+            document.getElementById("resultText").innerHTML = `
+                        <p>Detected behavior: ${data.result.behavior}</p>
+                        <p>Confidence: ${(data.result.confidence * 100).toFixed(
+                          2
+                        )}%</p>
+                        <h4>All predictions:</h4>
+                        <ul>
+                            ${Object.entries(data.result.predictions)
+                              .map(
+                                ([behavior, conf]) =>
+                                  `<li>${behavior}: ${(conf * 100).toFixed(
+                                    2
+                                  )}%</li>`
+                              )
+                              .join("")}
+                        </ul>
+                    `;
+
+            const video = document.getElementById("resultVideo");
+            video.src = data.result_video;
+            result.style.display = "block";
+          } else {
+            alert("Error: " + data.error);
+          }
+        } catch (error) {
+          alert("Error uploading file: " + error);
+        } finally {
+          loading.style.display = "none";
+        }
+      };
+    </script>
+  </body>
+</html>

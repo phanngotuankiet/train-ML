@@ -88,325 +88,173 @@ class CustomCNN(nn.Module):
         combined = torch.cat((cnn_features, resnet_features), dim=1)
         return self.combine_features(combined)
 
-# class YourDataset(Dataset):
-#     def __init__(self, root_dir, transform=None):
-#         """
-#         Custom Dataset for loading images and their labels.
+class TemporalCNN(nn.Module):
+    def __init__(self, base_cnn, num_classes=14, sequence_length=16):
+        super(TemporalCNN, self).__init__()
+        self.base_cnn = base_cnn
+        self.sequence_length = sequence_length
         
-#         Args:
-#             root_dir (str): Directory with all the images organized in class folders
-#             transform (callable, optional): Optional transform to be applied on images
-#         """
-#         self.root_dir = root_dir
-#         self.transform = transform
-#         self.classes = sorted(os.listdir(root_dir))  # Get class names from folder names
-#         self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
-        
-#         # Create list of (image_path, class_idx) tuples
-#         self.samples = []
-#         for class_name in self.classes:
-#             class_dir = os.path.join(root_dir, class_name)
-#             if not os.path.isdir(class_dir):
-#                 continue
-            
-#             class_idx = self.class_to_idx[class_name]
-#             for img_name in os.listdir(class_dir):
-#                 if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-#                     img_path = os.path.join(class_dir, img_name)
-#                     self.samples.append((img_path, class_idx))
-    
-#     def __len__(self):
-#         """Returns the total number of samples in the dataset"""
-#         return len(self.samples)
-    
-#     def __getitem__(self, idx):
-#         """
-#         Returns one sample of data, data and label (image and class).
-        
-#         Args:
-#             idx (int): Index of the sample to fetch
-            
-#         Returns:
-#             tuple: (image, label) where label is the class index
-#         """
-#         img_path, label = self.samples[idx]
-        
-#         try:
-#             # Load image using PIL
-#             image = Image.open(img_path).convert('RGB')
-            
-#             # Apply transformations if any
-#             if self.transform:
-#                 image = self.transform(image)
-            
-#             return image, label
-            
-#         except Exception as e:
-#             print(f"Error loading image {img_path}: {str(e)}")
-#             # Return a black image and the label in case of error
-#             if self.transform:
-#                 dummy_img = self.transform(Image.new('RGB', (64, 64), color='black'))
-#             else:
-#                 dummy_img = torch.zeros((3, 64, 64))
-#             return dummy_img, label
-    
-#     def get_class_names(self):
-#         """Returns list of class names"""
-#         return self.classes
-    
-#     def get_num_classes(self):
-#         """Returns total number of classes"""
-#         return len(self.classes)
-class YourDataset(Dataset):
-    def __init__(self, image_dir, label_dir, transform=None):
-        self.image_dir = image_dir
-        self.label_dir = label_dir
-        self.transform = transform
-        
-        # List all image files
-        self.image_paths = [
-            os.path.join(image_dir, img_name) 
-            for img_name in os.listdir(image_dir) 
-            if img_name.lower().endswith(('.png', '.jpg', '.jpeg'))
-        ]
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        
-        # Get corresponding label file
-        label_path = os.path.join(
-            self.label_dir, 
-            os.path.splitext(os.path.basename(img_path))[0] + '.txt'
+        # Add temporal layers
+        self.temporal_conv = nn.Sequential(
+            nn.Conv3d(512, 512, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.BatchNorm3d(512),
+            nn.ReLU(),
+            nn.Dropout3d(0.5)
         )
         
-        try:
-            # Load image
-            image = Image.open(img_path).convert('RGB')
-            if self.transform:
-                image = self.transform(image)
-            
-            # Load and process label
-            with open(label_path, 'r') as f:
-                # YOLO format: class x_center y_center width height
-                # We only need the class (first number)
-                line = f.readline().strip().split()[0]  # Get first number only
-                label = int(float(line))  # Convert to int, handling float strings
-            
-            return image, label
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.5,
+            bidirectional=True
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
 
-        except Exception as e:
-            print(f"Error loading data for {img_path}: {str(e)}")
-            # Return dummy data in case of error
-            dummy_img = torch.zeros((3, 64, 64)) if not self.transform else \
-                       self.transform(Image.new('RGB', (64, 64), color='black'))
-            return dummy_img, 0  # Return 0 as default class
+    def forward(self, x):
+        batch_size = x.size(0)
+        
+        # Process each frame through base CNN
+        features = []
+        for t in range(self.sequence_length):
+            frame_features = self.base_cnn(x[:, t])
+            features.append(frame_features)
+        
+        # Stack features
+        features = torch.stack(features, dim=1)
+        
+        # Apply 3D convolution
+        features = self.temporal_conv(features)
+        
+        # LSTM processing
+        lstm_out, _ = self.lstm(features.view(batch_size, self.sequence_length, -1))
+        
+        # Get final prediction using attention
+        attention_weights = torch.softmax(
+            self.attention(lstm_out), dim=1
+        )
+        weighted_features = torch.sum(
+            attention_weights.unsqueeze(-1) * lstm_out, dim=1
+        )
+        
+        return self.classifier(weighted_features)
 
-# class YOLOCNNModel:
-#     def __init__(self, data_yaml, weights='yolov8n.pt'):
-#         """
-#         Initialize YOLOCNNModel
-#         Args:
-#             data_yaml (str): Path to data.yaml file
-#             weights (str): Path to YOLO weights file
-#         """
-#         self.test_metrics = None 
-#         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#         self.current_epoch = 0
-        
-#         # Initialize YOLO model
-#         self.yolo = YOLO(weights)
-        
-#         # Initialize CNN model with 14 classes (fixed number for your dataset)
-#         self.cnn = CustomCNN(num_classes=14).to(self.device)
-        
-#         # Optimizer with learning rate scheduler
-#         self.optimizer = optim.AdamW(
-#             self.cnn.parameters(), 
-#             lr=0.001, 
-#             weight_decay=0.01
-#         )
-        
-#         # Learning rate scheduler
-#         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-#             self.optimizer, 
-#             mode='max', 
-#             factor=0.1, 
-#             patience=5,
-#             verbose=True
-#         )
-        
-#         # Loss function with class weights
-#         self.criterion = nn.CrossEntropyLoss(reduction='none')
-        
-#         self.data_yaml = data_yaml
-#         self.best_accuracy = 0
-#         self.early_stopping_counter = 0
-#         self.early_stopping_patience = 10
-        
-#     def calculate_class_weights(self, labels):
-#         """Tính toán class weights để xử lý imbalanced data"""
-#         class_counts = torch.bincount(labels)
-#         total = len(labels)
-#         weights = total / (len(class_counts) * class_counts.float())
-#         return weights.to(self.device)
-        
-#     def train_epoch(self, epoch, total_epochs, train_loader):
-#         epoch_start_time = time.time()
-        
-#         # Train YOLO
-#         results = self.yolo.train(
-#             data=self.data_yaml,
-#             epochs=1,
-#             imgsz=64,
-#             batch=32,
-#             exist_ok=True,
-#             resume=True
-#         )
-        
-#         # Train CNN
-#         self.cnn.train()
-#         running_loss = 0.0
-#         all_predictions = []
-#         all_labels = []
-        
-#         for batch_idx, (images, targets) in enumerate(train_loader):
-#             images, targets = images.to(self.device), targets.to(self.device)
-            
-#             # Get YOLO features
-#             with torch.no_grad():
-#                 yolo_features = self.yolo.predict(images, verbose=False)
-            
-#             # Forward pass
-#             self.optimizer.zero_grad()
-#             outputs = self.cnn(images)  # Using original images for CNN
-            
-#             # Calculate loss with class weights
-#             class_weights = self.calculate_class_weights(targets)
-#             loss = self.criterion(outputs, targets)
-#             weighted_loss = (loss * class_weights[targets]).mean()
-            
-#             # Backward pass
-#             weighted_loss.backward()
-            
-#             # Gradient clipping
-#             torch.nn.utils.clip_grad_norm_(self.cnn.parameters(), max_norm=1.0)
-            
-#             self.optimizer.step()
-            
-#             running_loss += weighted_loss.item()
-#             _, predicted = outputs.max(1)
-            
-#             all_predictions.extend(predicted.cpu().numpy())
-#             all_labels.extend(targets.cpu().numpy())
-            
-#             # Print batch progress
-#             if (batch_idx + 1) % 10 == 0:
-#                 print(f'Batch [{batch_idx + 1}/{len(train_loader)}] Loss: {weighted_loss.item():.4f}')
-        
-#         # Calculate metrics
-#         accuracy = accuracy_score(all_labels, all_predictions)
-#         precision, recall, f1, _ = precision_recall_fscore_support(
-#             all_labels, 
-#             all_predictions, 
-#             average='weighted'
-#         )
-        
-#         # Calculate epoch time
-#         epoch_time = time.time() - epoch_start_time
-        
-#         # Print epoch results
-#         print(f'\nEpoch [{epoch}/{total_epochs}]')
-#         print(f'Average Loss: {running_loss/len(train_loader):.4f}')
-#         print(f'Accuracy: {accuracy:.4f}')
-#         print(f'Precision: {precision:.4f}')
-#         print(f'Recall: {recall:.4f}')
-#         print(f'F1-Score: {f1:.4f}')
-#         print(f'Epoch Time: {datetime.timedelta(seconds=int(epoch_time))}')
-        
-#         return accuracy
-
-#     def validate(self, val_loader):
-#         """Đánh giá model trên validation set"""
-#         self.cnn.eval()
-#         all_predictions = []
-#         all_labels = []
-        
-#         with torch.no_grad():
-#             for images, targets in val_loader:
-#                 images, targets = images.to(self.device), targets.to(self.device)
-#                 outputs = self.cnn(images)
-#                 _, predicted = outputs.max(1)
-                
-#                 all_predictions.extend(predicted.cpu().numpy())
-#                 all_labels.extend(targets.cpu().numpy())
-        
-#         accuracy = accuracy_score(all_labels, all_predictions)
-#         precision, recall, f1, _ = precision_recall_fscore_support(
-#             all_labels, 
-#             all_predictions, 
-#             average='weighted'
-#         )
-        
-#         print('\nValidation Results:')
-#         print(f'Accuracy: {accuracy:.4f}')
-#         print(f'Precision: {precision:.4f}')
-#         print(f'Recall: {recall:.4f}')
-#         print(f'F1-Score: {f1:.4f}')
-        
-#         return accuracy
-class EnhancedDataset(Dataset):
-    def __init__(self, image_dir, label_dir, yolo_transform=None, cnn_transform=None):
-        """
-        Args:
-            image_dir: Directory containing images
-            label_dir: Directory containing labels
-            yolo_transform: Transform for YOLO model
-            cnn_transform: Transform for CNN model
-        """
+class VideoDataset(Dataset):
+    def __init__(self, image_dir, label_dir, sequence_length=16, transform=None):
         self.image_dir = image_dir
         self.label_dir = label_dir
-        self.yolo_transform = yolo_transform
-        self.cnn_transform = cnn_transform
+        self.sequence_length = sequence_length
+        self.transform = transform
         
-        # List all image files
+        # Thay đổi cách tìm files
         self.image_paths = [
-            os.path.join(image_dir, img_name) 
-            for img_name in os.listdir(image_dir) 
-            if img_name.lower().endswith(('.png', '.jpg', '.jpeg'))
+            os.path.join(image_dir, f) for f in os.listdir(image_dir)
+            if f.endswith(('.jpg', '.jpeg', '.png', '.mp4', '.avi'))
         ]
 
     def __getitem__(self, idx):
-        try:
-            # Load image
-            image = Image.open(img_path).convert('RGB')
-            
-            # Apply transforms with error handling
-            try:
-                yolo_image = self.yolo_transform(image) if self.yolo_transform else transforms.ToTensor()(image)
-                cnn_image = self.cnn_transform(image) if self.cnn_transform else transforms.ToTensor()(image)
-            except Exception as e:
-                print(f"Transform error for {img_path}: {str(e)}")
-                # Fallback to basic transform
-                basic_transform = transforms.Compose([
-                    transforms.Resize((64, 64)),
-                    transforms.ToTensor()
-                ])
-                yolo_image = basic_transform(image)
-                cnn_image = basic_transform(image)
-            
-            return (yolo_image, cnn_image), label
-            
-        except Exception as e:
-            print(f"Error loading data for {img_path}: {str(e)}")
-            # Return dummy data in case of error
-            dummy = torch.zeros((3, 64, 64))
-            return (dummy, dummy), 0
+        image_path = self.image_paths[idx]
+        if image_path.endswith(('.mp4', '.avi')):  # Nếu là video
+            frames = self._load_video(image_path)
+        else:  # Nếu là ảnh
+            image = Image.open(image_path).convert('RGB')
+            frames = [image] * self.sequence_length  # Duplicate ảnh để tạo sequence
+        
+        label = self._load_label(image_path)
+        
+        if self.transform:
+            frames = [self.transform(f) for f in frames]
+        
+        return torch.stack(frames), label
+
+    def _load_video(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Sample frames evenly
+        indices = np.linspace(0, total_frames-1, self.sequence_length, dtype=int)
+        
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = Image.fromarray(frame)
+                frames.append(frame)
+        
+        cap.release()
+        return frames
+
+    def _load_label(self, path):
+        # Implement your label loading logic here
+        # This is just an example - modify according to your label format
+        label_path = os.path.join(
+            self.label_dir, 
+            os.path.splitext(os.path.basename(path))[0] + '.txt'
+        )
+        
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                # Assuming label is the first number in the file
+                label = int(float(f.readline().strip().split()[0]))
+                return label
+        return 0  # Default label if not found
 
     def __len__(self):
         return len(self.image_paths)
+def get_transforms(is_training=True):
+    """
+    Get transforms for training/validation
+    """
+    # Base transforms (always applied)
+    base_transforms = [
+        transforms.Resize((64, 64)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ]
+    
+    if is_training:
+        # Add augmentation transforms for training
+        train_transforms = [
+            RandomHorizontalFlip(p=0.5),
+            RandomRotation(degrees=10),
+            RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0)),
+            RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            RandomPerspective(distortion_scale=0.2, p=0.5),
+            ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.1
+            ),
+            GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            RandomAdjustSharpness(sharpness_factor=2, p=0.5),
+        ]
+        return transforms.Compose(train_transforms + base_transforms)
+    else:
+        return transforms.Compose(base_transforms)
+
+def get_sampler(dataset):
+    """Create weighted sampler for balanced batches"""
+    labels = []
+    for _, label in dataset:
+        labels.append(label)
+    
+    class_counts = torch.bincount(torch.tensor(labels))
+    weights = 1.0 / class_counts[labels]
+    sampler = WeightedRandomSampler(weights, len(weights))
+    return sampler
 
 class YOLOCNNModel:
     def __init__(self, data_yaml, weights='yolov8n.pt'):
@@ -475,7 +323,7 @@ class YOLOCNNModel:
     def _compute_class_weights(self, data_yaml):
         """Compute class weights from training data"""
         class_counts = torch.zeros(14)
-        train_dir = "data/processed/dataYOLO2/labels/train"
+        train_dir = "data/dataYOLO2/labels/train"
         
         for label_file in os.listdir(train_dir):
             with open(os.path.join(train_dir, label_file), 'r') as f:
@@ -488,59 +336,55 @@ class YOLOCNNModel:
         return weights.to(self.device)
 
     def train_epoch(self, epoch, total_epochs, train_loader):
-            epoch_start_time = time.time()
-            self.cnn.train()
+        epoch_start_time = time.time()  # Bắt đầu tính thời gian
+        self.cnn.train()
+        
+        running_loss = 0.0
+        all_predictions = []
+        all_labels = []
+        
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            images = images.to(self.device)
+            targets = targets.to(self.device)
             
-            running_loss = 0.0
-            all_predictions = []
-            all_labels = []
+            # Forward pass through CNN
+            outputs = self.cnn(images)
             
-            for batch_idx, ((yolo_images, cnn_images), targets) in enumerate(train_loader):
-                yolo_images = yolo_images.to(self.device)
-                cnn_images = cnn_images.to(self.device)
-                targets = targets.to(self.device)
-                
-                # Get YOLO features using properly normalized images
-                with torch.no_grad():
-                    yolo_results = self.yolo.predict(yolo_images, verbose=False)
-                
-                # Forward pass through CNN using properly normalized images
-                outputs = self.cnn(cnn_images)
-                
-                # Rest of the training code remains same
-                class_weights = self.calculate_class_weights(targets)
-                loss = self.criterion(outputs, targets)
-                weighted_loss = (loss * class_weights[targets]).mean()
-                
-                self.optimizer.zero_grad()
-                weighted_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.cnn.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                
-                running_loss += weighted_loss.item()
-                _, predicted = outputs.max(1)
-                
-                all_predictions.extend(predicted.cpu().numpy())
-                all_labels.extend(targets.cpu().numpy())
-                
-                if (batch_idx + 1) % 10 == 0:
-                    print(f'Batch [{batch_idx + 1}/{len(train_loader)}] Loss: {weighted_loss.item():.4f}')
+            # Calculate loss
+            loss = self.criterion(outputs, targets)
             
-            # Calculate metrics
-            accuracy = accuracy_score(all_labels, all_predictions)
-            precision, recall, f1, _ = precision_recall_fscore_support(
-                all_labels, all_predictions, average='weighted'
-            )
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.cnn.parameters(), max_norm=1.0)
+            self.optimizer.step()
             
-            print(f'\nEpoch [{epoch}/{total_epochs}]')
-            print(f'Average Loss: {running_loss/len(train_loader):.4f}')
-            print(f'Accuracy: {accuracy:.4f}')
-            print(f'Precision: {precision:.4f}')
-            print(f'Recall: {recall:.4f}')
-            print(f'F1-Score: {f1:.4f}')
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
             
-            return accuracy
-
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(targets.cpu().numpy())
+            
+            if (batch_idx + 1) % 10 == 0:
+                print(f'Batch [{batch_idx + 1}/{len(train_loader)}] Loss: {loss.item():.4f}')
+        
+        # Calculate metrics
+        accuracy = accuracy_score(all_labels, all_predictions)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels, all_predictions, average='weighted'
+        )
+        
+        epoch_end_time = time.time()  # Kết thúc tính thời gian
+        epoch_duration = epoch_end_time - epoch_start_time  # Tính thời gian đã trôi qua
+        
+        print(f'\nEpoch [{epoch}/{total_epochs}]')
+        print(f'Average Loss: {running_loss/len(train_loader):.4f}')
+        print(f'Accuracy: {accuracy:.4f}')
+        print(f'Precision: {precision:.4f}')
+        print(f'Recall: {recall:.4f}')
+        print(f'F1-Score: {f1:.4f}')
+        print(f'Epoch Duration: {epoch_duration:.2f} seconds')  # In thời gian đã trôi qua
+        
+        return accuracy
     def validate(self, val_loader):
         """Evaluate model on validation set"""
         self.cnn.eval()
@@ -732,97 +576,34 @@ class YOLOCNNModel:
         else:
             print(f"Checkpoint file not found: {checkpoint_path}")
 
-
-   
-
-
-def get_transforms(is_training=True):
-    """
-    Get transforms for both YOLO and CNN paths
-    Args:
-        is_training (bool): Whether to include augmentation transforms
-    """
-    # Base transforms (always applied)
-    base_transforms = [
-        transforms.Resize((64, 64)),
-        transforms.ToTensor(),
-    ]
-    
-    # Augmentation transforms (only during training)
-    aug_transforms = [
-        # Geometric transforms
-        RandomHorizontalFlip(p=0.5),
-        RandomRotation(degrees=10),
-        RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0)),
-        RandomAffine(degrees=0, translate=(0.1, 0.1)),
-        RandomPerspective(distortion_scale=0.2, p=0.5),
-        
-        # Color/intensity transforms
-        ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.1
-        ),
-        GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-        RandomAdjustSharpness(sharpness_factor=2, p=0.5),
-    ]
-    
-    # CNN-specific normalization
-    cnn_normalize = [
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ]
-    
-    if is_training:
-        yolo_transform = transforms.Compose(aug_transforms + base_transforms)
-        cnn_transform = transforms.Compose(aug_transforms + base_transforms + cnn_normalize)
-    else:
-        yolo_transform = transforms.Compose(base_transforms)
-        cnn_transform = transforms.Compose(base_transforms + cnn_normalize)
-    
-    return yolo_transform, cnn_transform
-
-def get_sampler(dataset):
-    """Create weighted sampler for balanced batches"""
-    labels = []
-    for _, label in dataset:
-        labels.append(label)
-    
-    class_counts = torch.bincount(torch.tensor(labels))
-    weights = 1.0 / class_counts[labels]
-    sampler = WeightedRandomSampler(weights, len(weights))
-    return sampler
-
 def main():
-    # Get transforms for training data
-    train_yolo_transform, train_cnn_transform = get_transforms(is_training=True)
+    # Initialize datasets with video processing
+    # train_dataset = VideoDataset(
+    #     video_dir="data/videos/train",
+    #     label_dir="data/labels/train",
+    #     transform=get_transforms(is_training=True)
+    # )
     
     # Get transforms for validation/test data (no augmentation)
-    val_yolo_transform, val_cnn_transform = get_transforms(is_training=False)
+    # val_yolo_transform, val_cnn_transform = get_transforms(is_training=False)
     
     # Load datasets with appropriate transforms
-    train_dataset = EnhancedDataset(
-        image_dir="data/processed/dataYOLO2/images/train",
-        label_dir="data/processed/dataYOLO2/labels/train",
-        yolo_transform=train_yolo_transform,
-        cnn_transform=train_cnn_transform
+    train_dataset = VideoDataset(
+        image_dir="data/dataYOLO2/images/train",
+        label_dir="data/dataYOLO2/labels/train",
+        transform=get_transforms(is_training=True)  # Chỉ lấy một transform
     )
     
-    val_dataset = EnhancedDataset(
-        image_dir="data/processed/dataYOLO2/images/val",
-        label_dir="data/processed/dataYOLO2/labels/val",
-        yolo_transform=val_yolo_transform,
-        cnn_transform=val_cnn_transform
+    val_dataset = VideoDataset(
+        image_dir="data/dataYOLO2/images/val",
+        label_dir="data/dataYOLO2/labels/val",
+        transform=get_transforms(is_training=False)  # Chỉ lấy một transform
     )
     
-    test_dataset = EnhancedDataset(
-        image_dir="data/processed/dataYOLO2/images/test",
-        label_dir="data/processed/dataYOLO2/labels/test",
-        yolo_transform=val_yolo_transform,
-        cnn_transform=val_cnn_transform
+    test_dataset = VideoDataset(
+        image_dir="data/dataYOLO2/images/test",
+        label_dir="data/dataYOLO2/labels/test",
+        transform=get_transforms(is_training=False)  # Chỉ lấy một transform
     )
     
     print(f"Train dataset size: {len(train_dataset)}")
@@ -833,7 +614,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=32,
-        sampler=get_sampler(train_dataset),  # Add weighted sampler
+        sampler=get_sampler(train_dataset),
         num_workers=0
     )
     
@@ -852,8 +633,8 @@ def main():
     )
     
     # Initialize model
-    data_yaml = "data/processed/dataYOLO2/data.yaml"
-    model = YOLOCNNModel(data_yaml)  # Just pass data_yaml path
+    data_yaml = "data/dataYOLO2/data.yaml"
+    model = YOLOCNNModel(data_yaml)
     
     # Resume training if checkpoint exists
     start_epoch = model.resume_training()
